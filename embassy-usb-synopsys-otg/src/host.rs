@@ -198,7 +198,11 @@ pub unsafe fn on_host_interrupt(r: Otg, state: &HostState<'_>) {
     }
 
     // RX FIFO non-empty (IN data received)
-    while r.gintsts().read().rxflvl() {
+    // PATCH(c5r): bounded per ISR entry; rxflvl is level-triggered so any
+    // remainder re-raises the interrupt (embassy-rs/embassy#6312).
+    let mut rx_budget = 1024;
+    while r.gintsts().read().rxflvl() && rx_budget > 0 {
+        rx_budget -= 1;
         let status = r.grxstsp().read();
         let ch_num = status.epnum() as usize; // In host mode, epnum field is channel number
         let len = status.bcnt() as usize;
@@ -394,7 +398,13 @@ impl<'d> OtgHost<'d> {
         let phy_type = self.instance.phy_type;
 
         // Wait for AHB bus to be idle before configuring registers.
-        while !r.grstctl().read().ahbidl() {}
+        // PATCH(c5r): bounded (embassy-rs/embassy#6312).
+        for _ in 0..100_000 {
+            if r.grstctl().read().ahbidl() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
 
         // Configure GCCFG for host mode based on core version.
         // The register layout varies across DWC2 revisions; use CID to select.
@@ -878,7 +888,12 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                 w.set_chena(true);
                 w.set_chdis(true);
             });
-            while r.hcchar(ch).read().chena() {
+            // PATCH(c5r): bounded — with the port gone the halt never
+            // completes and this froze the executor (embassy-rs/embassy#6312).
+            for _ in 0..100_000 {
+                if !r.hcchar(ch).read().chena() {
+                    break;
+                }
                 core::hint::spin_loop();
             }
             r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
