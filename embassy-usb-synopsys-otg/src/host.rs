@@ -491,10 +491,15 @@ impl<'d> OtgHost<'d> {
         });
 
         // Wait for flush to complete
-        while {
+        // PATCH(c5r): bounded wait (sync context). The flush bits can fail to
+        // clear without a PHY clock; the original spin was unbounded.
+        // https://github.com/embassy-rs/embassy/issues/6312
+        for _ in 0..100_000 {
             let x = r.grstctl().read();
-            x.rxfflsh() || x.txfflsh()
-        } {}
+            if !x.rxfflsh() && !x.txfflsh() {
+                break;
+            }
+        }
 
         // Power the port
         let safe_val = hprt_read_safe(r);
@@ -757,10 +762,17 @@ impl<'d> UsbHostController<'d> for OtgHost<'d> {
             w.set_txfflsh(true);
             w.set_txfnum(0x10); // all TX FIFOs
         });
-        while {
+        // PATCH(c5r): bounded, yielding wait. With no device attached the
+        // flush bits can never clear (no PHY clock) and the original
+        // unbounded synchronous spin froze the whole executor.
+        // https://github.com/embassy-rs/embassy/issues/6312
+        for _ in 0..50 {
             let x = r.grstctl().read();
-            x.rxfflsh() || x.txfflsh()
-        } {}
+            if !x.rxfflsh() && !x.txfflsh() {
+                break;
+            }
+            embassy_time::Timer::after_micros(100).await;
+        }
 
         // Assert reset on the port.
         let safe_val = hprt_read_safe(r);
@@ -1105,8 +1117,17 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                     // channel after NAK. Explicitly halt and wait for completion
                     // (CHH) before reconfiguring, otherwise the retry races with
                     // the in-progress halt and the new transfer never starts.
-                    self.halt_channel();
-                    let _halt = self.wait_for_result().await; // expect CHH
+                    //
+                    // PATCH(c5r): only when the channel is still enabled. The
+                    // core auto-halts periodic channels after NAK and the ISR
+                    // can consume that CHH together with the NAK, so waiting
+                    // for a second CHH on an already-disabled channel parks
+                    // this future forever (same guard as Linux dwc2_hc_halt).
+                    // https://github.com/embassy-rs/embassy/issues/6312
+                    if self.regs.hcchar(self.index).read().chena() {
+                        self.halt_channel();
+                        let _halt = self.wait_for_result().await; // expect CHH
+                    }
                 }
                 yield_now().await;
                 continue;
