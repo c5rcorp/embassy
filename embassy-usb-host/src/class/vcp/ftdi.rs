@@ -41,7 +41,7 @@ use embassy_usb_driver::host::{PipeError, SplitInfo, UsbHostAllocator, UsbPipe, 
 use embassy_usb_driver::{Direction as UsbDirection, EndpointAddress, EndpointInfo, EndpointType};
 
 use crate::control::{ControlType, Recipient, RequestType, SetupPacket};
-use crate::descriptor::ConfigurationDescriptor;
+use crate::descriptor::ConfigurationDescriptorChain;
 use crate::handler::EnumerationInfo;
 
 /// FTDI VID and common PIDs.
@@ -219,7 +219,7 @@ pub struct FtdiInfo {
 /// `interface_idx = 0` for single-channel parts (FT232R); `0..N` for multi-port
 /// parts (FT2232/FT4232).
 pub fn find_ftdi(config_desc: &[u8], interface_idx: u8) -> Option<FtdiInfo> {
-    let cfg = ConfigurationDescriptor::try_from_slice(config_desc).ok()?;
+    let cfg = ConfigurationDescriptorChain::try_from_slice(config_desc).ok()?;
 
     let mut seen = 0u8;
     for iface in cfg.iter_interface() {
