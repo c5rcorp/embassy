@@ -7,3 +7,4 @@
 //! VID/PID based.
 
 pub mod cp210x;
+pub mod ftdi;
