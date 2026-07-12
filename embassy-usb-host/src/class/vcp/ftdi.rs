@@ -193,6 +193,11 @@ fn baud_divisor(baud: u32) -> Option<(u16, u16)> {
         57600 => (0x0034, 0x0000),
         // 115200 == 115384 on the FT232R (3 MHz / 26); libftdi reports 115384.
         115200 | 115384 => (0x001A, 0x0000),
+        // 125000: the BMG CLARIOstar's rate. On its FT232H (bcdDevice 0x0900)
+        // libftdi uses the 120 MHz/10 = 12 MHz H-series base → divisor 96 (0x0060)
+        // with the CLK/10 select bit in wIndex (0x0200). This differs from the
+        // FT232R 3 MHz base the other entries use (which would be 0x0018 here).
+        125000 => (0x0060, 0x0200),
         230400 => (0x000D, 0x0000),
         _ => return None,
     })
