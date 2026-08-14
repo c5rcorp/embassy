@@ -284,14 +284,11 @@ pub unsafe fn on_host_interrupt(r: Otg, state: &HostState<'_>) {
             }
         }
 
-        // Slave-mode multi-packet IN quirk: after each received data packet
-        // the DWC2 core dequeues this channel from its transaction scheduler
-        // even though HCCHAR.CHENA stays at 1 and HCTSIZ.PKTCNT > 0. Writing
-        // CHENA=1 again re-queues the channel for the next IN token. Without
-        // this, multi-packet bulk/interrupt IN transfers stop after the
-        // first packet. In DMA modes the core self-schedules; STM32 OTG
-        // runs in slave mode so software must re-arm per packet.
-        if ch_num < ch_count && matches!(status.pktstsh(), vals::Pktstsh::IN_DATA_RX) {
+        // Slave mode needs rearming after each full IN packet.
+        if ch_num < ch_count
+            && matches!(status.pktstsh(), vals::Pktstsh::IN_DATA_RX)
+            && len == r.hcchar(ch_num).read().mpsiz() as usize
+        {
             let hctsiz = r.hctsiz(ch_num).read();
             if hctsiz.pktcnt() > 0 {
                 r.hcchar(ch_num).modify(|w| {
@@ -859,10 +856,6 @@ impl<T: pipe::Type, D: pipe::Direction> Drop for Channel<'_, T, D> {
 }
 
 impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
-    fn save_data_toggle(&mut self) {
-        self.data_toggle = self.regs.hctsiz(self.index).read().dpid() == vals::Dpid::DATA1.to_bits();
-    }
-
     fn configure_channel(&self, dir_in: bool, ep_type: EndpointType, pktcnt: u16, xfrsiz: u32, dpid: u8) {
         let r = self.regs;
         let ch = self.index;
@@ -1261,7 +1254,18 @@ impl<T: pipe::Type, D: pipe::Direction> UsbPipe<T, D> for Channel<'_, T, D> {
         };
 
         let n = self.do_in_transfer(T::ep_type(), buf, dpid.to_bits()).await?;
-        self.save_data_toggle();
+        let mps = self.max_packet_size as usize;
+        let mut packets = if n == 0 { 1 } else { n.div_ceil(mps) };
+        if matches!(T::ep_type(), EndpointType::Bulk | EndpointType::Control)
+            && n > 0
+            && n < buf.len()
+            && n.is_multiple_of(mps)
+        {
+            packets += 1;
+        }
+        if packets & 1 != 0 {
+            self.data_toggle = !self.data_toggle;
+        }
         Ok(n)
     }
 
@@ -1276,7 +1280,11 @@ impl<T: pipe::Type, D: pipe::Direction> UsbPipe<T, D> for Channel<'_, T, D> {
         };
 
         self.do_out_transfer(T::ep_type(), buf, dpid.to_bits()).await?;
-        self.save_data_toggle();
+        let mps = self.max_packet_size as usize;
+        let packets = if buf.is_empty() { 1 } else { buf.len().div_ceil(mps) };
+        if packets & 1 != 0 {
+            self.data_toggle = !self.data_toggle;
+        }
         Ok(())
     }
 
