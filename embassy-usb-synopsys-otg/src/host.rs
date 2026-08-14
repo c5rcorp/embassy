@@ -162,8 +162,7 @@ pub unsafe fn on_host_interrupt(r: Otg, state: &HostState<'_>) {
                 };
                 state.fields.port_speed.store(speed, Ordering::Release);
                 state.fields.port_event.fetch_or(PORT_EVENT_ENABLED, Ordering::Release);
-            } else {
-                // Port disabled
+            } else if !hprt.pcsts() {
                 state
                     .fields
                     .port_event
@@ -860,6 +859,10 @@ impl<T: pipe::Type, D: pipe::Direction> Drop for Channel<'_, T, D> {
 }
 
 impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
+    fn save_data_toggle(&mut self) {
+        self.data_toggle = self.regs.hctsiz(self.index).read().dpid() == vals::Dpid::DATA1.to_bits();
+    }
+
     fn configure_channel(&self, dir_in: bool, ep_type: EndpointType, pktcnt: u16, xfrsiz: u32, dpid: u8) {
         let r = self.regs;
         let ch = self.index;
@@ -1258,14 +1261,7 @@ impl<T: pipe::Type, D: pipe::Direction> UsbPipe<T, D> for Channel<'_, T, D> {
         };
 
         let n = self.do_in_transfer(T::ep_type(), buf, dpid.to_bits()).await?;
-        // DWC2 toggles DPID internally for every packet in a multi-packet
-        // transfer; reflect that in our stored toggle. Zero-byte reads still
-        // consume one packet (ZLP).
-        let mps = self.max_packet_size as usize;
-        let packets = if n == 0 { 1 } else { n.div_ceil(mps) };
-        if packets & 1 != 0 {
-            self.data_toggle = !self.data_toggle;
-        }
+        self.save_data_toggle();
         Ok(n)
     }
 
@@ -1280,11 +1276,7 @@ impl<T: pipe::Type, D: pipe::Direction> UsbPipe<T, D> for Channel<'_, T, D> {
         };
 
         self.do_out_transfer(T::ep_type(), buf, dpid.to_bits()).await?;
-        let mps = self.max_packet_size as usize;
-        let packets = if buf.is_empty() { 1 } else { buf.len().div_ceil(mps) };
-        if packets & 1 != 0 {
-            self.data_toggle = !self.data_toggle;
-        }
+        self.save_data_toggle();
         Ok(())
     }
 
