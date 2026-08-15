@@ -1109,18 +1109,12 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
             ((buf.len() as u32 + self.max_packet_size as u32 - 1) / self.max_packet_size as u32) as u16
         };
 
+        self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
+        self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
+        self.enable_channel();
+
         loop {
-            self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
-            self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
-            self.enable_channel();
-
             let result = self.wait_for_result().await;
-            let count = self.rx_count();
-            self.clear_rx_buffer();
-
-            if result == CH_RESULT_COMPLETE {
-                return Ok(count);
-            }
 
             if result == CH_RESULT_NAK {
                 if is_periodic {
@@ -1139,11 +1133,29 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                         self.halt_channel();
                         let _halt = self.wait_for_result().await; // expect CHH
                     }
+                    self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
+                    self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
+                    self.enable_channel();
+                } else if self.state.channels[self.index].result.load(Ordering::Acquire) == CH_RESULT_NONE {
+                    // PATCH(c5r): a NAK only dequeues a non-periodic channel;
+                    // HCTSIZ keeps the remaining packet count and next PID, and
+                    // received packets stay in the armed buffer. Reconfiguring
+                    // here discarded that progress and restarted at a stale
+                    // toggle, so a reply arriving in bursts lost its head and
+                    // the next read hit DTERR. Re-queue and keep waiting; the
+                    // peek skips re-enabling when a completion raced in behind
+                    // this NAK.
+                    self.enable_channel();
                 }
                 yield_now().await;
                 continue;
             }
 
+            let count = self.rx_count();
+            self.clear_rx_buffer();
+            if result == CH_RESULT_COMPLETE {
+                return Ok(count);
+            }
             Self::result_to_error(result)?;
             return Ok(count);
         }
