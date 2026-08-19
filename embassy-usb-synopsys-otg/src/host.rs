@@ -804,6 +804,45 @@ impl<'d> UsbHostController<'d> for OtgHost<'d> {
     }
 }
 
+/// Reclaims a channel whose transfer future is dropped mid-flight — a caller
+/// timing out, most often. Nulling the ISR's buffer pointer is what makes that
+/// safe: the ISR checks it before writing, so it can no longer touch memory the
+/// caller has taken back, and its `else` branch still drains the RX FIFO so the
+/// core does not stall on the packet in flight. The halt is only *requested*;
+/// `configure_channel` already spin-waits for CHENA before the channel is
+/// reused, so there is nothing to await here.
+struct TransferGuard<'d> {
+    regs: Otg,
+    state: HostState<'d>,
+    index: usize,
+    armed: bool,
+}
+
+impl TransferGuard<'_> {
+    /// The transfer reached a terminal state on its own; stop guarding it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let ch_state = &self.state.channels[self.index];
+        // SAFETY: same single-writer discipline as `clear_rx_buffer`.
+        unsafe {
+            *ch_state.rx_buffer.get() = core::ptr::null_mut();
+            *ch_state.rx_capacity.get() = 0;
+        }
+        self.regs.hcchar(self.index).modify(|w| {
+            w.set_chena(true);
+            w.set_chdis(true);
+        });
+    }
+}
+
 /// A USB host channel for performing transfers.
 ///
 /// The channel is automatically released when dropped.
@@ -1060,6 +1099,12 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
         // must issue a PING token before the next OUT, but configure_channel
         // rewrites HCTSIZ each iteration so we re-assert it here.
         let mut do_ping = false;
+        let mut guard = TransferGuard {
+            regs: self.regs,
+            state: self.state,
+            index: self.index,
+            armed: true,
+        };
         loop {
             self.configure_channel(false, ep_type, pktcnt, data.len() as u32, dpid);
             if do_ping {
@@ -1071,7 +1116,10 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
 
             let result = self.wait_for_result().await;
             match result {
-                CH_RESULT_COMPLETE => return Ok(()),
+                CH_RESULT_COMPLETE => {
+                    guard.disarm();
+                    return Ok(());
+                }
                 CH_RESULT_NAK => {
                     yield_now().await;
                     continue;
@@ -1081,7 +1129,10 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
                     yield_now().await;
                     continue;
                 }
-                _ => return Self::result_to_error(result),
+                _ => {
+                    guard.disarm();
+                    return Self::result_to_error(result);
+                }
             }
         }
     }
@@ -1112,6 +1163,13 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
         self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
         self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
         self.enable_channel();
+
+        let mut guard = TransferGuard {
+            regs: self.regs,
+            state: self.state,
+            index: self.index,
+            armed: true,
+        };
 
         loop {
             let result = self.wait_for_result().await;
@@ -1153,6 +1211,7 @@ impl<T: pipe::Type, D: pipe::Direction> Channel<'_, T, D> {
 
             let count = self.rx_count();
             self.clear_rx_buffer();
+            guard.disarm();
             if result == CH_RESULT_COMPLETE {
                 return Ok(count);
             }
