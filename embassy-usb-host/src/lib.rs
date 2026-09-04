@@ -456,5 +456,5 @@ pub fn bus<'d, C: UsbHostController<'d>>(
 }
 
 #[cfg(test)]
-#[path = "../tests/enumeration.rs"]
+#[path = "../tests/unit/enumeration.rs"]
 mod enumeration_tests;
