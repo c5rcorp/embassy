@@ -143,6 +143,17 @@ impl BusState {
     }
 }
 
+struct AddressReservation<'a> {
+    state: &'a BusState,
+    address: u8,
+}
+
+impl Drop for AddressReservation<'_> {
+    fn drop(&mut self) {
+        self.state.free_address(self.address);
+    }
+}
+
 impl Default for BusState {
     fn default() -> Self {
         Self::new()
@@ -273,6 +284,10 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
         let _enum_guard = self.state.enum_lock.lock().await;
 
         let addr = self.state.alloc_address().ok_or(EnumerationError::NoPipe)?;
+        let reservation = AddressReservation {
+            state: self.state,
+            address: addr,
+        };
 
         // use smallest size "8", since some devices use lower than default for given speed.
         const DEFAULT_MAX_PACKET_SIZE: u16 = 8;
@@ -287,10 +302,7 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
         let mut ch = self
             .alloc
             .alloc_pipe::<pipe::Control, pipe::InOut>(0, &ep0_info, route.split())
-            .map_err(|_| {
-                self.state.free_address(addr);
-                EnumerationError::NoPipe
-            })?;
+            .map_err(|_| EnumerationError::NoPipe)?;
 
         trace!("[enum] Getting max_packet_size for new device");
         let max_packet_size0 = {
@@ -308,7 +320,6 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
                             Timer::after_millis(1).await;
                             continue;
                         } else {
-                            self.state.free_address(addr);
                             return Err(e.into());
                         }
                     }
@@ -317,7 +328,6 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
         };
         // USB 2.0 §9.6.1: legal EP0 max packet sizes are 8, 16, 32, 64.
         if !matches!(max_packet_size0, 8 | 16 | 32 | 64) {
-            self.state.free_address(addr);
             return Err(EnumerationError::InvalidDescriptor);
         }
 
@@ -338,10 +348,7 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
         let mut ch = self
             .alloc
             .alloc_pipe::<pipe::Control, pipe::InOut>(addr, &ep0_info, route.split())
-            .map_err(|_| {
-                self.state.free_address(addr);
-                EnumerationError::NoPipe
-            })?;
+            .map_err(|_| EnumerationError::NoPipe)?;
 
         let retries = 5;
         let dev_desc = async {
@@ -368,13 +375,9 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
 
         // Step 4: Get configuration descriptor header (9 bytes).
         let setup = SetupPacket::get_config_descriptor(0, 9);
-        let n = ch
-            .control_in(&setup.to_bytes(), &mut config_buf[..9])
-            .await
-            .inspect_err(|_| self.state.free_address(addr))?;
+        let n = ch.control_in(&setup.to_bytes(), &mut config_buf[..9]).await?;
 
         if n < 9 {
-            self.state.free_address(addr);
             return Err(EnumerationError::InvalidDescriptor);
         }
 
@@ -383,7 +386,6 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
         let total_len = config_header.total_len as usize;
 
         if total_len > config_buf.len() {
-            self.state.free_address(addr);
             return Err(EnumerationError::ConfigBufferTooSmall(total_len));
         }
 
@@ -393,7 +395,6 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
 
         // USB 2.0 §9.4.3: the device must return exactly total_len bytes for a full config descriptor.
         if n != total_len {
-            self.state.free_address(addr);
             return Err(EnumerationError::InvalidDescriptor);
         }
 
@@ -401,15 +402,14 @@ impl<'d, A: UsbHostAllocator<'d>> BusHandle<'d, A> {
 
         // Step 5: SET_CONFIGURATION.
         let setup = SetupPacket::set_configuration(config_header.configuration_value);
-        ch.control_out(&setup.to_bytes(), &[])
-            .await
-            .inspect_err(|_| self.state.free_address(addr))?;
+        ch.control_out(&setup.to_bytes(), &[]).await?;
 
         info!("Device configured (config={})", config_header.configuration_value);
 
         // Pipe is released on drop.
         drop(ch);
 
+        core::mem::forget(reservation);
         Ok((
             EnumerationInfo {
                 device_address: addr,
@@ -454,3 +454,7 @@ pub fn bus<'d, C: UsbHostController<'d>>(
         BusHandle { alloc, state },
     )
 }
+
+#[cfg(test)]
+#[path = "../tests/enumeration.rs"]
+mod enumeration_tests;
